@@ -1,0 +1,9 @@
+/gh-queued-job
+/gh-queued-job.exe
+dist/
+
+# IDE
+.idea/
+.vscode/
+.claude/
+.serena/
