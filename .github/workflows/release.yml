@@ -36,6 +36,9 @@ jobs:
             goarch: amd64
             platform_name: windows-amd64
             ext: .exe
+          - goos: linux
+            goarch: s390x
+            platform_name: linux-s390x
     steps:
       - uses: actions/checkout@v7
         with:
