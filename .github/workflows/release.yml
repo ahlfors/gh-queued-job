@@ -2,8 +2,10 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+  pull_request:
+    types: [opened, reopened, synchronize]
   workflow_dispatch:
 
 permissions:
@@ -12,10 +14,27 @@ permissions:
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
+  update_release_draft:
+    name: Update release draft
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.release_drafter.outputs.tag_name }}
+    steps:
+      - uses: release-drafter/release-drafter@b1476f6e6eb133afa41ed8589daba6dc69b4d3f5
+        id: release_drafter
+        with:
+          commitish: main
+
   build:
     name: Build ${{ matrix.platform_name }}
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    needs: update_release_draft
     strategy:
       fail-fast: false
       matrix:
@@ -32,16 +51,19 @@ jobs:
           - goos: linux
             goarch: arm64
             platform_name: linux-arm64
+          - goos: linux
+            goarch: s390x
+            platform_name: linux-s390x
           - goos: windows
             goarch: amd64
             platform_name: windows-amd64
             ext: .exe
-          - goos: linux
-            goarch: s390x
-            platform_name: linux-s390x
+    env:
+      VERSION: ${{ needs.update_release_draft.outputs.tag_name }}
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: main
           persist-credentials: false
 
       - name: Set up Go
@@ -49,35 +71,48 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Get binary name
+        id: binary
+        run: |
+          MODULE_NAME=$(go list -m)
+          BINARY_NAME=$(basename "$MODULE_NAME")
+          echo "name=${BINARY_NAME}" >> "$GITHUB_OUTPUT"
+
       - name: Build binary
         env:
           CGO_ENABLED: "0"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
-          VERSION="${GITHUB_REF_NAME}"
-          ARTIFACT="gh-queued-job_${VERSION}_${{ matrix.platform_name }}${{ matrix.ext }}"
-          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "${ARTIFACT}" .
-          sha256sum "${ARTIFACT}" > "${ARTIFACT}.sha256"
+          BINARY="${{ steps.binary.outputs.name }}"
+          ARTIFACT_NAME="${BINARY}_${VERSION}_${{ matrix.platform_name }}${{ matrix.ext }}"
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "${ARTIFACT_NAME}" .
+          sha256sum "${ARTIFACT_NAME}" > "${ARTIFACT_NAME}.sha256"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.platform_name }}
           path: |
-            gh-queued-job_*
+            ${{ steps.binary.outputs.name }}_${{ env.VERSION }}_${{ matrix.platform_name }}${{ matrix.ext }}
+            ${{ steps.binary.outputs.name }}_${{ env.VERSION }}_${{ matrix.platform_name }}${{ matrix.ext }}.sha256
           retention-days: 1
 
   release:
     name: Publish Release
     runs-on: ubuntu-latest
-    needs: [build]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'workflow_dispatch'
+    needs: [update_release_draft, build]
     permissions:
       contents: write
+      attestations: write
+      id-token: write
+    env:
+      VERSION: ${{ needs.update_release_draft.outputs.tag_name }}
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: main
           persist-credentials: false
 
       - name: Download all build artifacts
@@ -92,9 +127,71 @@ jobs:
           cd dist
           cat *.sha256 > checksums.txt
 
+      - name: Generate attestations
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
+          subject-exclude: "*.sha256,checksums.txt"
+
       - name: Upload release assets
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "${GITHUB_REF_NAME}" \
-            --generate-notes \
-            dist/*
+          cd dist
+          gh release upload "${VERSION}" \
+            *darwin-arm64 \
+            *darwin-amd64 \
+            *linux-amd64 \
+            *linux-arm64 \
+            *linux-s390x \
+            *windows-amd64.exe \
+            *.sha256 \
+            checksums.txt \
+            --clobber
+
+      - name: Publish draft release
+        uses: release-drafter/release-drafter@b1476f6e6eb133afa41ed8589daba6dc69b4d3f5
+        with:
+          publish: true
+          commitish: main
+
+      - name: Get semver
+        id: get-semver
+        shell: pwsh
+        run: |
+          $tag = $env:VERSION
+          if (-not $tag) {
+            Write-Error "Release tag is empty."
+            exit 1
+          }
+          if ($tag -match '^v?(\d+)\.(\d+)\.(\d+)$') {
+            $major = $matches[1]
+            $minor = $matches[2]
+            $hasPrefix = $tag.StartsWith('v')
+            $prefix = if ($hasPrefix) { 'v' } else { '' }
+            $majorTag = if ($major -eq '0') { '' } else { $prefix + $major }
+            $minorTag = if ("$major.$minor" -eq '0.0') { '' } else { $prefix + $major + '.' + $minor }
+            "major_tag=$majorTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            "minor_tag=$minorTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          } else {
+            Write-Error "Release tag '$tag' is not a valid semver (expected v1.2.3)."
+            exit 1
+          }
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.VERSION }}
+
+      - name: Update major tag
+        if: ${{ steps.get-semver.outputs.major_tag != '' }}
+        env:
+          MAJOR_TAG: ${{ steps.get-semver.outputs.major_tag }}
+        shell: pwsh
+        run: |
+          git push -f origin "refs/tags/${env:VERSION}:refs/tags/${env:MAJOR_TAG}"
+
+      - name: Update minor tag
+        if: ${{ steps.get-semver.outputs.minor_tag != '' }}
+        env:
+          MINOR_TAG: ${{ steps.get-semver.outputs.minor_tag }}
+        shell: pwsh
+        run: |
+          git push -f origin "refs/tags/${env:VERSION}:refs/tags/${env:MINOR_TAG}"
