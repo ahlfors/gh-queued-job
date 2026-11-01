@@ -128,7 +128,7 @@ jobs:
           cat *.sha256 > checksums.txt
 
       - name: Generate attestations
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*
           subject-exclude: "*.sha256,checksums.txt"
